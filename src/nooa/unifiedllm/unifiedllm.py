@@ -8,7 +8,7 @@ import logging
 import re
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -17,6 +17,7 @@ from typing import Any, Literal, cast
 import litellm
 from pydantic import BaseModel, RootModel
 
+from .admission import AdmissionController, AdmissionPolicy
 from .http_config import HttpConfig
 from .retry import EmptyContentError, sync_retry, with_retry
 from .retry_config import RetryConfig
@@ -65,6 +66,19 @@ def _record_llm_metric(event: str, detail: Any = None) -> None:
             cb(event, detail)
         except Exception as e:  # noqa: BLE001
             logger.debug("Metric callback failed for event %r: %s", event, e)
+
+
+def _record_admission_observation(detail: dict[str, Any]) -> None:
+    """Record one admission outcome on the generation span and harness metrics."""
+    _record_llm_metric("llm_queue", detail)
+    try:
+        from opentelemetry import trace as otel_trace
+
+        span = otel_trace.get_current_span()
+        if span and span.is_recording():
+            span.add_event("llm.queue", attributes=detail)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Could not record LLM admission event: %s", e)
 
 
 @contextmanager
@@ -1153,10 +1167,40 @@ def _update_token_calibration(
 class UnifiedLLM(ABC):
     _registry_config: dict[str, Any] | None
 
-    def __init__(self, model: str, **config):
+    def __init__(
+        self,
+        model: str,
+        *,
+        max_in_flight: int | None = None,
+        concurrency_group: str | None = None,
+        queue_timeout: float | None = None,
+        admission_controller: AdmissionController | None = None,
+        **config,
+    ):
+        if admission_controller is not None and any(
+            value is not None for value in (max_in_flight, concurrency_group, queue_timeout)
+        ):
+            raise ValueError(
+                "admission_controller cannot be combined with max_in_flight, "
+                "concurrency_group, or queue_timeout"
+            )
         self.model = model
         self.config = config
         self._registry_config = None
+        self.max_in_flight = max_in_flight
+        self.concurrency_group = concurrency_group
+        self.queue_timeout = queue_timeout
+        self.admission_controller = admission_controller
+        self._admission_policy: AdmissionController = (
+            admission_controller
+            if admission_controller is not None
+            else AdmissionPolicy(
+                max_in_flight=max_in_flight,
+                concurrency_group=concurrency_group,
+                queue_timeout=queue_timeout,
+                api_base=config.get("api_base") or config.get("base_url"),
+            )
+        )
         # Cache control injection — shared by CompletionClient and ResponsesClient
         self.cache_control_injection_points: list[dict[str, Any]] = (
             DEFAULT_CACHE_CONTROL_INJECTION_POINTS
@@ -1452,7 +1496,48 @@ async def _collect_async(raw: Any) -> "litellm.ModelResponse":
     return raw
 
 
-async def _litellm_acompletion(api_params: dict[str, Any]) -> Any:
+async def _run_async_provider_call[T](
+    call: Callable[[], Awaitable[T]],
+    admission_policy: AdmissionController,
+    *,
+    unadmitted_call: Callable[[], Awaitable[T]] | None = None,
+) -> T:
+    """Run one provider attempt, holding admission through its actual exit.
+
+    Acquisition happens before the provider task is created, so cancelling a
+    queued caller cannot dispatch abandoned work.  Once dispatched, the
+    provider task owns the permit and releases it in ``finally``.  Shielding
+    keeps that accounting correct when the caller is cancelled while remote
+    work or a stream is still active.
+    """
+    permit = await admission_policy.acquire(_record_admission_observation)
+    if permit is None:
+        return await (unadmitted_call or call)()
+
+    async def run_and_release() -> T:
+        try:
+            return await call()
+        finally:
+            if permit is not None:
+                permit.release()
+
+    try:
+        task = asyncio.create_task(run_and_release())
+    except BaseException:
+        if permit is not None:
+            permit.release()
+        raise
+
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        task.add_done_callback(_consume_async_provider_result)
+        raise
+
+
+async def _litellm_acompletion(
+    api_params: dict[str, Any],
+) -> Any:
     """Await LiteLLM without cancelling its nested provider coroutine.
 
     LiteLLM runs sync ``completion()`` in an executor for async chat calls.
@@ -1466,15 +1551,16 @@ async def _litellm_acompletion(api_params: dict[str, Any]) -> Any:
     Shielding lets LiteLLM finish consuming that provider coroutine while the
     caller still receives ``CancelledError`` immediately.
     """
+
     task = asyncio.create_task(litellm.acompletion(**api_params))
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
-        task.add_done_callback(_consume_litellm_acompletion_result)
+        task.add_done_callback(_consume_async_provider_result)
         raise
 
 
-def _consume_litellm_acompletion_result(task: asyncio.Task[Any]) -> None:
+def _consume_async_provider_result(task: asyncio.Task[Any]) -> None:
     try:
         task.result()
     except BaseException:
@@ -1750,6 +1836,10 @@ class CompletionClient(UnifiedLLM):
         http_config: HttpConfig | None = None,
         # use system as default for cache_control_injection_points
         cache_control_injection_points: list[dict[str, Any]] | None = None,
+        max_in_flight: int | None = None,
+        concurrency_group: str | None = None,
+        queue_timeout: float | None = None,
+        admission_controller: AdmissionController | None = None,
         **config,
     ):
         """
@@ -1774,9 +1864,24 @@ class CompletionClient(UnifiedLLM):
                 enable prompt caching (for example: {"role": "system"} or
                 {"role": "tool", "position": "last"}). Applied to all calls.
                 Note: Do NOT manually add cache_control to message content when using this.
+            max_in_flight: Optional maximum number of concurrent async provider
+                attempts in this process for the resolved concurrency group.
+            concurrency_group: Optional group shared across clients and aliases.
+                When omitted, ``api_base`` identifies an opaque endpoint group.
+            queue_timeout: Optional maximum seconds to wait for admission.
+            admission_controller: Optional application-supplied controller. Use
+                this for a shared process or distributed admission scope. It
+                cannot be combined with the process-local admission options.
             **config: Additional configuration passed to litellm (api_key, api_base, etc.)
         """
-        super().__init__(model, **config)
+        super().__init__(
+            model,
+            max_in_flight=max_in_flight,
+            concurrency_group=concurrency_group,
+            queue_timeout=queue_timeout,
+            admission_controller=admission_controller,
+            **config,
+        )
         self.retry_config = retry_config or RetryConfig()
         self._http_config = http_config or HttpConfig()
         self._http = _ClientHttp.for_completion(self.model, self.config, self._http_config)
@@ -2030,7 +2135,17 @@ class CompletionClient(UnifiedLLM):
             api_params.setdefault("client", http_client.async_client)
 
         async def _make_call():
-            raw_response = await _collect_async(await _litellm_acompletion(api_params))
+            async def admitted_call():
+                return await _collect_async(await litellm.acompletion(**api_params))
+
+            async def unadmitted_call():
+                return await _collect_async(await _litellm_acompletion(api_params))
+
+            raw_response = await _run_async_provider_call(
+                admitted_call,
+                self._admission_policy,
+                unadmitted_call=unadmitted_call,
+            )
             reasoning, _ = _extract_reasoning_and_usage(raw_response)
             text_content = raw_response.choices[0].message.content or ""  # type: ignore[union-attr]
 
@@ -2261,6 +2376,10 @@ class ResponsesClient(UnifiedLLM):
         retry_config: RetryConfig | None = None,
         http_config: HttpConfig | None = None,
         cache_control_injection_points: list[dict[str, Any]] | None = None,
+        max_in_flight: int | None = None,
+        concurrency_group: str | None = None,
+        queue_timeout: float | None = None,
+        admission_controller: AdmissionController | None = None,
         **config,
     ):
         """
@@ -2286,9 +2405,24 @@ class ResponsesClient(UnifiedLLM):
             cache_control_injection_points: Optional list of role/position rules to
                 enable prompt caching (for example: {"role": "system"} or
                 {"role": "tool", "position": "last"}). Applied to all calls.
+            max_in_flight: Optional maximum number of concurrent async provider
+                attempts in this process for the resolved concurrency group.
+            concurrency_group: Optional group shared across clients and aliases.
+                When omitted, ``api_base`` identifies an opaque endpoint group.
+            queue_timeout: Optional maximum seconds to wait for admission.
+            admission_controller: Optional application-supplied controller. Use
+                this for a shared process or distributed admission scope. It
+                cannot be combined with the process-local admission options.
             **config: Additional configuration passed to litellm (api_key, api_base, etc.)
         """
-        super().__init__(model, **config)
+        super().__init__(
+            model,
+            max_in_flight=max_in_flight,
+            concurrency_group=concurrency_group,
+            queue_timeout=queue_timeout,
+            admission_controller=admission_controller,
+            **config,
+        )
         self.retry_config = retry_config or RetryConfig()
         self._http_config = http_config or HttpConfig()
         self._http = _ClientHttp.for_responses(self.model, self.config, self._http_config)
@@ -2521,7 +2655,13 @@ class ResponsesClient(UnifiedLLM):
             api_params.setdefault("client", http_client.async_client)
 
         async def _make_call():
-            return cast("litellm.ResponsesAPIResponse", await litellm.aresponses(**api_params))
+            async def call_provider():
+                return cast("litellm.ResponsesAPIResponse", await litellm.aresponses(**api_params))
+
+            return await _run_async_provider_call(
+                call_provider,
+                self._admission_policy,
+            )
 
         # Track LLM call for debugging (visible via SIGUSR2 if nooa debug handler installed)
         with _track_llm_call(model=self.model, endpoint=self.config.get("api_base")):

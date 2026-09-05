@@ -43,6 +43,9 @@ class ModelConfig(BaseModel):
     max_tokens: int | None = None
     temperature: float | None = None
     top_p: float | None = None
+    concurrency_group: str | None = None
+    max_in_flight: int | None = None
+    queue_timeout: float | None = None
 
     @classmethod
     def from_registry(cls, name: str, raw: dict[str, Any]) -> ModelConfig:

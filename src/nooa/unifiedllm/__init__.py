@@ -1,5 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+from nooa.unifiedllm.admission import (
+    AdmissionCallCapError,
+    AdmissionController,
+    AdmissionError,
+    AdmissionPermit,
+    AdmissionTimeoutError,
+    AdmissionUnavailableError,
+)
+from nooa.unifiedllm.broker_admission import (
+    AdmissionBroker,
+    BrokerAdmissionConfig,
+    BrokerAdmissionController,
+    BrokerAdmissionSnapshot,
+)
 from nooa.unifiedllm.fake import FakeLLMClient
 from nooa.unifiedllm.http_config import HttpConfig
 from nooa.unifiedllm.registry import (
@@ -48,6 +62,17 @@ __all__ = [
     "create_tool_from_callable",
     # Response types
     "LLMResponse",
+    # Admission control
+    "AdmissionBroker",
+    "AdmissionCallCapError",
+    "AdmissionController",
+    "AdmissionError",
+    "AdmissionPermit",
+    "AdmissionTimeoutError",
+    "AdmissionUnavailableError",
+    "BrokerAdmissionConfig",
+    "BrokerAdmissionController",
+    "BrokerAdmissionSnapshot",
     # HTTP config
     "HttpConfig",
     # Retry utilities
